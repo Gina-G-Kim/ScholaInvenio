@@ -1,0 +1,14 @@
+data/
+.git/
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.DS_Store
+.env
+README.md
+*.md
+tests/
+note
+assets/

@@ -1,0 +1,13 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+curl_cffi==0.7.4
+beautifulsoup4==4.12.3
+lxml==5.3.0
+pydantic==2.10.4
+# Google Scholar path only (not needed if you only use the default OpenAlex provider)
+# setuptools: Python 3.12 dropped distutils from the stdlib, but
+#             undetected-chromedriver still imports it. setuptools provides a shim.
+setuptools>=75
+scholarly==1.7.11
+undetected-chromedriver==3.5.5
+selenium==4.27.1

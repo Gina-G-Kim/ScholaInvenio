@@ -1,0 +1,30 @@
+services:
+  scholainvenio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: scholainvenio:1.0.0
+    container_name: scholainvenio
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    volumes:
+      # collected XML lives on the host (spec 6)
+      - ./data:/data
+    # headless Chrome dies in the default /dev/shm (64MB) — give it more.
+    shm_size: "1gb"
+    environment:
+      # OpenAlex API key. Without one: $0.01/day (100 requests). With one:
+      # $1/day (10,000). Free at openalex.org/settings/api — effectively required.
+      OPENALEX_API_KEY: "${OPENALEX_API_KEY:-}"
+      # contact info sent as a courtesy when no key is set
+      OPENALEX_MAILTO: "${OPENALEX_MAILTO:-}"
+      # everything below only matters if Google Scholar is enabled.
+      # random sleep in this range between each paper fetched (avoids an IP ban)
+      GSCHOLAR_SLEEP_MIN: "${GSCHOLAR_SLEEP_MIN:-5.0}"
+      GSCHOLAR_SLEEP_MAX: "${GSCHOLAR_SLEEP_MAX:-10.0}"
+      CHROME_BINARY: "${CHROME_BINARY:-/usr/bin/chromium}"
+      # must be the writable copy the Dockerfile creates — /usr/bin/chromedriver
+      # is root-owned and undetected-chromedriver patches this file in place.
+      CHROMEDRIVER_PATH: "${CHROMEDRIVER_PATH:-/home/scholar/chromedriver}"
+      TZ: "${TZ:-UTC}"
+    restart: unless-stopped

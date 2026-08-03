@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ScholaInvenio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <!-- clicking the logo/name returns to a blank session (home) -->
+    <button class="brand" id="homeBtn" title="Back to start">
+      <span class="logo">SI</span>
+      <span class="brandtext">
+        <span class="btitle">ScholaInvenio</span>
+        <span class="sub">Academic paper search · OpenAlex · DBLP · Google Scholar · XML export</span>
+      </span>
+    </button>
+
+    <div class="searchrow">
+      <input id="mainQuery" type="text" placeholder="Search terms or Scholar keyword syntax" autocomplete="off" />
+      <!-- spec 1.1: a button next to the search box opens the keyword builder -->
+      <button id="builderToggle" class="btn ghost" title="Open the keyword builder">⚙ Keywords</button>
+      <button id="runSearch" class="btn primary">Search</button>
+    </div>
+
+    <div class="opts">
+      <label title="Defaults to the ceiling. Above it, use &quot;Load more&quot; in the list.">Max results
+        <input id="maxResults" type="number" value="1000" min="1" max="1000" /></label>
+      <label class="chk" title="Fetches abstracts from each result's landing page (Scholar's snippet is often truncated; DBLP has none at all).">
+        <input id="fetchAbstracts" type="checkbox" /> Enrich abstracts from source pages (slow)</label>
+      <button id="sessionsBtn" class="btn ghost sm">Saved sessions</button>
+    </div>
+  </header>
+
+  <!-- keyword builder: an inline panel, not a popup -->
+  <section id="builder" class="builder hidden">
+    <div class="builder-head">
+      <strong>Keyword search</strong>
+      <span class="muted" id="builderTarget">Round 1</span>
+      <button id="builderClose" class="btn ghost sm">Close</button>
+    </div>
+
+    <div class="grid">
+      <label class="fld"><span>All these words <em>(space = AND)</em></span>
+        <input data-k="all_words" type="text" placeholder="knowledge representation" /></label>
+
+      <label class="fld"><span>Exact phrase <em>" "</em></span>
+        <input data-k="exact_phrase" type="text" placeholder="temporal reasoning (separate multiple with ;)" /></label>
+
+      <label class="fld"><span>Any of these <em>OR</em></span>
+        <input data-k="or_terms" type="text" placeholder="ontology, taxonomy (comma-separated)" /></label>
+
+      <label class="fld"><span>Exclude <em>-</em></span>
+        <input data-k="exclude" type="text" placeholder="survey, review (comma-separated)" /></label>
+
+      <label class="fld"><span>Wildcard <em>*</em></span>
+        <input data-k="wildcard" type="text" placeholder='reason* or "deep * network"' /></label>
+
+      <label class="fld"><span>Author <em>author:</em></span>
+        <input data-k="author" type="text" placeholder="PJ Hayes" /></label>
+
+      <label class="fld"><span>Title <em>intitle:</em></span>
+        <input data-k="intitle" type="text" placeholder="naive physics" /></label>
+
+      <label class="fld"><span>Venue / source <em>source:</em></span>
+        <input data-k="source" type="text" placeholder="Artificial Intelligence" /></label>
+
+      <label class="fld sm"><span>From year</span>
+        <input data-k="year_from" type="number" placeholder="1990" /></label>
+
+      <label class="fld sm"><span>To year</span>
+        <input data-k="year_to" type="number" placeholder="2025" /></label>
+    </div>
+
+    <div class="preview">
+      <span class="muted">Generated query</span>
+      <code id="queryPreview">—</code>
+      <div class="builder-actions">
+        <button id="builderReset" class="btn ghost sm">Clear</button>
+        <button id="builderApply" class="btn primary sm">Apply to search box</button>
+      </div>
+    </div>
+    <p class="hint">
+      Author, title, and venue repeat the syntax for every word (e.g. <code>PJ Hayes</code> → <code>author:PJ author:Hayes</code>).
+      This syntax is automatically translated into the selected providers' native query language, and any
+      condition a provider doesn't support is re-checked locally after fetching.
+    </p>
+  </section>
+
+  <div id="keyhint" class="keyhint hidden"></div>
+  <div id="banner" class="banner hidden"></div>
+
+  <main class="workspace">
+    <!-- spec 7: round lists stack horizontally, scrollbar-controlled -->
+    <div id="columns" class="columns">
+      <div class="empty-state">
+        <h2>Start with a search</h2>
+        <p>Round 1 results are saved as XML, and round-by-round lists pile up here from the left.</p>
+      </div>
+    </div>
+
+    <!-- spec 4.1: a side panel, not a popup -->
+    <aside id="detail" class="detail">
+      <div class="detail-empty">
+        <p>Click a paper's title<br />to see its full record here.</p>
+      </div>
+    </aside>
+  </main>
+
+  <div id="sessions" class="sessions hidden">
+    <div class="sessions-head">
+      <strong>Saved sessions</strong>
+      <button id="sessionsClose" class="btn ghost sm">Close</button>
+    </div>
+    <div id="sessionsList" class="sessions-list"></div>
+  </div>
+
+  <div id="busy" class="busy hidden"><div class="spinner"></div><span id="busyText">Searching…</span></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

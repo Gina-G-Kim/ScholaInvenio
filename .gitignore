@@ -1,0 +1,18 @@
+.env
+.env.*
+!.env.example
+
+data/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+.DS_Store
+
+# personal scratch notes, not part of the project
+/note
+
+# kept locally for development, not published
+/tests/
