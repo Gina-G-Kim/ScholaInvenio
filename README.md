@@ -77,8 +77,9 @@ zero results.
 - **A GUI with no build step**: static HTML, CSS, and vanilla JS, no
   framework, no bundler.
 - **Sort** any round by year or citation count.
-- **Load more** beyond the initial batch, appended straight into the same
-  round's XML file.
+- **Infinite scroll**, not a "load more" click. Round 1 fetches a quick first
+  batch; scrolling a list near its bottom fetches the next batch in the
+  background and appends it straight into the same round's XML file.
 - **Natural-language session names**, generated from the query
   (`author PJ Hayes, words "naive physics" -survey, 1990~2020`) instead of
   raw keyword syntax.
@@ -104,7 +105,9 @@ stays visible until every one of its sources is hidden.
 Google Scholar's own deliberate per-result delay (5-10s, see below) makes it
 far slower than the other two; it's capped to its own small result count
 per search independently of the overall ceiling (`GSCHOLAR_MAX_RESULTS`,
-default 20) so that always querying it doesn't mean always waiting minutes.
+default 10) so that always querying it doesn't mean always waiting minutes.
+Unlike OpenAlex and DBLP it has no cursor to resume later, so this cap is
+its whole contribution for a search, not just a first page.
 
 DBLP is a manually curated, **computer-science-only** bibliography with no
 abstracts and no citation counts, but it's often more complete than OpenAlex
@@ -337,15 +340,23 @@ Round *n* filters the *previous round's* list. It never touches the
 network.
 
 <details>
-<summary>Loading more than the ceiling</summary>
+<summary>Loading more than the first batch</summary>
 
-A single fetch caps at 1000 results per provider. Past that, a bubble above
-the list shows the actual total and offers to fetch 1000 more.
+Round 1 only fetches a small first batch (`initial_batch` in `/api/config`,
+50 by default) — fast, since it no longer waits on paging deep into any one
+provider before showing anything. Scrolling a round's list within about
+300px of its bottom fetches the next batch (`page_batch`, also 50 by
+default) in the background and appends it in place; a quiet "Scroll for
+more…" line marks a round that has more, "Loading more…" while a fetch is
+in flight. There's no click, no prompt, and no upper limit on how many
+batches accumulate this way, up to 1000 results per provider for a single
+round.
 
 - Fetched results are appended to that round's existing XML, not written to
   a new file.
 - Providers resume from a cursor, so nothing already seen is fetched again
-  (any overlap is still deduplicated by ID).
+  (any overlap is still deduplicated by ID). Google Scholar has no cursor to
+  resume from (see Providers), so it only ever contributes to round 1.
 - Any round derived from this one is now based on stale data, so it's
   deleted, with a note explaining why.
 
@@ -425,7 +436,7 @@ saved session.
 | `OPENALEX_MAILTO` | none | courtesy contact when no key is set |
 | `HOST_PORT` | `8000` | host-side port |
 | `GSCHOLAR_SLEEP_MIN` / `MAX` | `5.0` / `10.0` | random wait in seconds per Scholar result |
-| `GSCHOLAR_MAX_RESULTS` | `20` | Scholar's own result cap per search (see Providers) |
+| `GSCHOLAR_MAX_RESULTS` | `10` | Scholar's own result cap per search (see Providers) |
 | `GSCHOLAR_PROXY` | none | `tor`, `free`, or `http://host:port` — see Providers |
 | `GSCHOLAR_TOR_PORT` / `_CONTROL_PORT` / `_PASSWORD` | `9050` / `9051` / none | only used when `GSCHOLAR_PROXY=tor` |
 | `CHROME_BINARY` | `/usr/bin/chromium` | Chrome or Chromium binary path |

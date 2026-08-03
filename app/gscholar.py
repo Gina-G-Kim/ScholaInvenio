@@ -49,9 +49,12 @@ SLEEP_MAX = float(os.environ.get("GSCHOLAR_SLEEP_MAX") or 10.0)
 
 # Scholar now runs on every search (see providers.py's DEFAULT_PROVIDERS) --
 # capped independently of the overall max_results ceiling so that "always on"
-# doesn't mean "always wait tens of minutes". A user who wants deeper Scholar
-# coverage for one search can still raise this.
-MAX_RESULTS = int(os.environ.get("GSCHOLAR_MAX_RESULTS") or 20)
+# doesn't mean "always wait tens of minutes". Kept small since every search
+# waits on it regardless of round 1's own INITIAL_BATCH (there's no cursor to
+# resume later -- see gscholar.py's module docstring -- so this is the whole
+# budget, not just a first page). A user who wants deeper Scholar coverage
+# for one search can still raise this.
+MAX_RESULTS = int(os.environ.get("GSCHOLAR_MAX_RESULTS") or 10)
 
 _driver_lock = threading.Lock()
 _driver = None

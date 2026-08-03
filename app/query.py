@@ -164,6 +164,25 @@ def split_source_terms(text: str) -> tuple[str, str]:
     return render_query(remaining), " ".join(source_only)
 
 
+def source_only_words(text: str) -> str:
+    """Bare words from source: terms, with the syntax itself stripped off.
+
+    For a venue-only query (e.g. a formal name split across several source:
+    tokens per spec 2.1), split_source_terms's 'remaining' half is empty --
+    there's nothing left to hand a provider with no venue operator at all.
+    This gives that caller something to search by as plain keywords instead
+    of giving up with an empty query; the source: terms still get checked
+    properly afterward via split_source_terms's own residual text.
+    """
+    words: list[str] = []
+    for node in parse_query(text):
+        terms = node.terms if isinstance(node, OrGroup) else [node]
+        for t in terms:
+            if t.field == "source" and not t.negated:
+                words.extend(t.value.split())
+    return " ".join(words)
+
+
 # --------------------------------------------------------------------------- #
 # Building (GUI keyword builder -> query string)
 # --------------------------------------------------------------------------- #
