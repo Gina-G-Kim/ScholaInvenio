@@ -10,13 +10,14 @@ const state = {
   builderTarget: "main",      // "main" | "refine"
   refineDraft: { query: "", scope: "title_abstract" },
   sorts: {},                  // round number -> sort key
-  config: { max_results: 1000, page_batch: 1000 },
+  config: { max_results: 1000, initial_batch: 50, page_batch: 50 },
   // Every provider is always queried (see providers.py's DEFAULT_PROVIDERS);
   // this is a post-search, client-side show/hide instead of a pre-search
   // opt-in. A source in here is hidden; a paper is hidden only once *all*
   // of its sources are (a paper both OpenAlex and DBLP found stays visible
   // if only DBLP is hidden).
   hiddenSources: new Set(),
+  loadingMore: new Set(),     // round numbers currently mid-background-fetch
 };
 
 const PROVIDER_LABELS = { openalex: "OpenAlex", gscholar: "Google Scholar", dblp: "DBLP" };
@@ -168,7 +169,9 @@ async function runSearch() {
         query,
         year_from: state.mainYearFrom ?? null,
         year_to: state.mainYearTo ?? null,
-        max_results: parseInt($("#maxResults").value, 10) || undefined,
+        // no `max_results` -- the server's own INITIAL_BATCH keeps the first
+        // response quick; scrolling near the bottom of the list fetches
+        // further batches on its own (see maybeLoadMore below).
         fetch_abstracts: $("#fetchAbstracts").checked,
         // no `providers` field -- the server always queries every registered
         // provider (see providers.py's DEFAULT_PROVIDERS); which ones show up
@@ -182,7 +185,7 @@ async function runSearch() {
     state.sorts = {};
     state.refineDraft = { query: "", scope: "title_abstract" };
     history.replaceState(null, "", `?session=${encodeURIComponent(out.session_id)}`);
-    render();
+    render(true);
     const note = out.round.notes ? ` ${out.round.notes}` : "";
     banner(`Round 1 complete — ${out.round.count} results, saved to round_01.xml.${note}`, "ok", 14000);
   } catch (err) {
@@ -211,10 +214,14 @@ function goHome() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Load more (fetches in additional batches beyond the ceiling)        */
+/* Load more -- fetched automatically as the list is scrolled, in the  */
+/* background, rather than a manual "load more" button (spec 7 update) */
 /* ------------------------------------------------------------------ */
-async function fetchMore(number) {
-  busy(true, "Fetching more…");
+async function fetchMore(number, { silent = false } = {}) {
+  if (state.loadingMore.has(number)) return;   // already fetching this round
+  state.loadingMore.add(number);
+  if (!silent) busy(true, "Fetching more…");
+  render();   // shows the inline "loading more…" row at the bottom of the list
   try {
     const out = await api(`/api/session/${state.sessionId}/round/${number}/more`, { method: "POST" });
     const idx = state.rounds.findIndex((r) => r.number === number);
@@ -223,16 +230,31 @@ async function fetchMore(number) {
     if (out.dropped_rounds && out.dropped_rounds.length) {
       state.rounds = state.rounds.filter((r) => !out.dropped_rounds.includes(r.number));
     }
+    state.loadingMore.delete(number);
     render();
-    const dropped = out.dropped_rounds && out.dropped_rounds.length
-      ? ` Later rounds (${out.dropped_rounds.join(", ")}) were removed since their basis changed.` : "";
-    banner(`+${out.added} results — ${out.round.count} total, saved to round_${String(number).padStart(2,"0")}.xml.${dropped}`,
-           "ok", 12000);
+    if (!silent) {
+      const dropped = out.dropped_rounds && out.dropped_rounds.length
+        ? ` Later rounds (${out.dropped_rounds.join(", ")}) were removed since their basis changed.` : "";
+      banner(`+${out.added} results — ${out.round.count} total, saved to round_${String(number).padStart(2,"0")}.xml.${dropped}`,
+             "ok", 12000);
+    }
   } catch (err) {
-    banner(err.message);
+    state.loadingMore.delete(number);
+    render();
+    // A background fetch failing quietly is better than interrupting
+    // scrolling -- has_more is untouched, so the next scroll near the
+    // bottom just tries again.
+    if (!silent) banner(err.message);
   } finally {
-    busy(false);
+    if (!silent) busy(false);
   }
+}
+
+/* Called on scroll; fetches the next batch once the list is scrolled
+   near its bottom, if this round has more and isn't already fetching. */
+function maybeLoadMore(round) {
+  if (!round.has_more || state.loadingMore.has(round.number)) return;
+  fetchMore(round.number, { silent: true });
 }
 
 /* ------------------------------------------------------------------ */
@@ -262,7 +284,7 @@ async function runRefine() {
     });
     state.rounds.push(out.round);
     state.refineDraft = { query: "", scope: state.refineDraft.scope };
-    render();
+    render(true);
     const file = `round_${String(out.round.number).padStart(2, "0")}.xml`;
     banner(`Round ${out.round.number} complete — ${out.round.count} results, saved to ${file}.`, "ok");
   } catch (err) {
@@ -293,7 +315,7 @@ async function rollback(number) {
       state.rounds = [];
     }
     state.selected = null;
-    render();
+    render(true);
     banner(`Deleted: ${out.removed.join(", ") || "nothing"}`, "ok", 6000);
   } catch (err) {
     banner(err.message);
@@ -316,8 +338,17 @@ function periodLabel(round) {
   return `${round.year_from ?? ""}~${round.year_to ?? ""}`;
 }
 
-function render() {
+function render(scrollToEnd = false) {
   const wrap = $("#columns");
+
+  // A background (scroll-triggered) fetch rebuilds the same round's column
+  // in place -- without this, the list would jump back to the top on every
+  // append, which defeats the point of loading more as the user scrolls.
+  const scrollPositions = new Map();
+  wrap.querySelectorAll(".col-list[data-round]").forEach((list) => {
+    scrollPositions.set(list.dataset.round, list.scrollTop);
+  });
+
   wrap.innerHTML = "";
 
   if (!state.rounds.length) {
@@ -335,8 +366,16 @@ function render() {
     wrap.append(buildColumn(round, index === state.rounds.length - 1));
   });
 
-  // scroll to the right when a new round is added (spec 7)
-  requestAnimationFrame(() => { wrap.scrollLeft = wrap.scrollWidth; });
+  wrap.querySelectorAll(".col-list[data-round]").forEach((list) => {
+    const prev = scrollPositions.get(list.dataset.round);
+    if (prev) list.scrollTop = prev;
+  });
+
+  // scroll to the right only when a genuinely new round was just added (spec 7) --
+  // not on every background append, which would yank a mid-scroll user sideways.
+  if (scrollToEnd) {
+    requestAnimationFrame(() => { wrap.scrollLeft = wrap.scrollWidth; });
+  }
   renderDetail(currentPaper());
 }
 
@@ -410,25 +449,16 @@ function buildColumn(round, isLast) {
 
   /* --- list: titles only (spec 4) --- */
   const list = el("div", "col-list");
+  list.dataset.round = String(round.number);
 
-  // when the result count exceeds the ceiling, a bubble confirms fetching more
-  if (round.has_more) {
-    const known = round.available || round.count;
-    const bubble = el("div", "morebubble");
-    const text = el("div", "mb-text");
-    text.innerHTML = `This search has <b>${known.toLocaleString()}+ results</b>. ` +
-                     `Only <b>${round.count.toLocaleString()}</b> have been fetched so far.<br>` +
-                     `Fetch ${(state.config.page_batch || 1000).toLocaleString()} more?`;
-    bubble.append(text);
-    const acts = el("div", "mb-actions");
-    const yes = el("button", "btn primary sm", "Load more");
-    yes.addEventListener("click", () => fetchMore(round.number));
-    const no = el("button", "btn ghost sm", "Dismiss");
-    no.addEventListener("click", () => bubble.remove());
-    acts.append(yes, no);
-    bubble.append(acts);
-    list.append(bubble);
-  }
+  // Beyond the first batch, more is fetched automatically as this list is
+  // scrolled near its bottom, instead of a manual "load more" prompt.
+  const SCROLL_FETCH_THRESHOLD = 300; // px from the bottom
+  list.addEventListener("scroll", () => {
+    if (list.scrollHeight - list.scrollTop - list.clientHeight < SCROLL_FETCH_THRESHOLD) {
+      maybeLoadMore(round);
+    }
+  });
 
   if (!shown.length) {
     list.append(el("div", "item-empty",
@@ -457,6 +487,13 @@ function buildColumn(round, isLast) {
       renderDetail(paper);
     });
     list.append(item);
+  }
+  if (state.loadingMore.has(round.number)) {
+    list.append(el("div", "item-loading", "Loading more…"));
+  } else if (round.has_more) {
+    // a quiet placeholder confirms there's more to scroll to, without
+    // prompting for a click the way the old "load more" bubble did
+    list.append(el("div", "item-loading muted", "Scroll for more…"));
   }
   col.append(list);
 
@@ -671,7 +708,7 @@ async function loadSession(sessionId) {
     $("#sessions").classList.add("hidden");
     // keeping the session in the URL lets a refresh or bookmark come back to it.
     history.replaceState(null, "", `?session=${encodeURIComponent(out.id)}`);
-    render();
+    render(true);
   } catch (err) {
     banner(err.message);
   } finally {
@@ -702,12 +739,9 @@ state.mainYearTo = null;
 
 $("#homeBtn").addEventListener("click", goHome);
 
-// the ceiling is decided server-side; hardcoding it on the frontend would let the two drift apart.
+// the batch sizes are decided server-side; hardcoding them on the frontend would let the two drift apart.
 api("/api/config").then((cfg) => {
   state.config = cfg;
-  const box = $("#maxResults");
-  box.max = cfg.max_results;
-  box.value = cfg.max_results;      // default to the ceiling
   // without a key, OpenAlex allows only 100 requests/day. That fails quietly, so warn up front.
   if (!cfg.openalex_has_key) {
     const hint = $("#keyhint");

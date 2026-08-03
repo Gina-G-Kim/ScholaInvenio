@@ -23,7 +23,7 @@ from . import gscholar as gs
 from . import openalex as oa
 from .filters import apply_filter
 from .models import SCOPE_ALL, Paper
-from .query import split_source_terms
+from .query import source_only_words, split_source_terms
 
 OPENALEX = "openalex"
 GSCHOLAR = "gscholar"
@@ -42,7 +42,15 @@ PROVIDER_LABELS = {
 DEFAULT_PROVIDERS = (OPENALEX, DBLP, GSCHOLAR)
 
 MAX_RESULTS = 1000        # per-provider ceiling for a single "search"
-PAGE_BATCH = 1000         # additional amount fetched per "load more"
+# The first response used to try for the full MAX_RESULTS ceiling before
+# anything showed up, and getting the rest meant clicking "load more" by
+# hand. Now round 1 only fetches this many -- fast, since it no longer waits
+# on paging deep into any one provider -- and the GUI keeps fetching further
+# batches on its own as the user scrolls near the bottom of the list (see
+# app.js), with no button and no upper prompt; PAGE_BATCH is the size of
+# each of those follow-up fetches.
+INITIAL_BATCH = 50
+PAGE_BATCH = 50
 
 
 class ProviderError(RuntimeError):
@@ -74,6 +82,15 @@ async def search_gscholar(
     # carry a venue field, so the same field-scoped local check as OpenAlex's
     # residual path works unchanged).
     scholar_query, source_only = split_source_terms(query)
+    # A venue-only query (very common in this tool -- a formal name split
+    # across several source: tokens per spec 2.1) strips to nothing here,
+    # and Scholar refuses an empty query -- confirmed live: 'source:USENIX'
+    # alone silently returned 0 results from Scholar, no error, nothing to
+    # explain why. Falling back to the venue's own words as plain keywords
+    # gives it something to search by; the source_only recheck below still
+    # enforces the actual venue match on whatever comes back.
+    if not scholar_query.strip() and source_only:
+        scholar_query = source_only_words(query)
     # Scholar's own deliberate per-result sleep (5-10s, see gscholar.py) makes
     # honoring the full max_results ceiling impractical now that every search
     # runs it -- capped independently so "always on" doesn't mean "always

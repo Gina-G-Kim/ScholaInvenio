@@ -297,23 +297,12 @@ body { display: flex; flex-direction: column; overflow: hidden; }
   background: var(--panel2); color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
 }
 
-/* ---------------- load-more bubble ---------------- */
-.morebubble {
-  position: relative; margin: 10px 12px 14px;
-  background: #1b2c46; border: 1px solid #2f4d78; border-radius: 10px;
-  padding: 10px 12px; font-size: 12px; line-height: 1.5;
+/* ---------------- scroll-triggered "load more" row ---------------- */
+/* spec 7 update: more is fetched automatically near the bottom of the
+   list, appended in place -- no more manual button/bubble. */
+.item-loading {
+  padding: 10px 12px; font-size: 11.5px; text-align: center; color: var(--muted);
 }
-/* speech-bubble tail */
-.morebubble::after {
-  content: ""; position: absolute; top: -7px; left: 22px;
-  width: 12px; height: 12px; background: #1b2c46;
-  border-left: 1px solid #2f4d78; border-top: 1px solid #2f4d78;
-  transform: rotate(45deg);
-}
-.morebubble .mb-text { color: #cfe0ff; }
-.morebubble .mb-text b { color: #fff; }
-.morebubble .mb-actions { display: flex; gap: 6px; margin-top: 8px; }
-.morebubble .btn { flex: 1; }
 
 /* ---------------- session deletion ---------------- */
 .srow { position: relative; padding-right: 30px; }

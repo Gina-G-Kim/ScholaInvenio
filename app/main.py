@@ -18,6 +18,7 @@ from .models import Round, SCOPE_ALL, SCOPE_TITLE, SCOPE_TITLE_ABSTRACT
 from .naming import describe_query
 from .providers import (
     DEFAULT_PROVIDERS,
+    INITIAL_BATCH,
     MAX_RESULTS,
     PAGE_BATCH,
     PROVIDER_LABELS,
@@ -60,13 +61,14 @@ class SearchIn(BaseModel):
     query: str = ""
     year_from: int | None = None
     year_to: int | None = None
-    # Default to the ceiling. The official API returns 200-1000 per page, so
-    # this doesn't multiply the request count much. Only Google Scholar is
-    # slow and can get blocked partway through, in which case whatever was
-    # collected so far is kept.
-    max_results: int = Field(default=MAX_RESULTS, ge=1, le=MAX_RESULTS)
+    # A small first batch, not the ceiling -- round 1 used to try for
+    # MAX_RESULTS before anything came back at all. The GUI fetches further
+    # batches of its own on scroll (see app.js), so there's no more "search a
+    # huge number, then ask before continuing"; if Google Scholar gets
+    # blocked partway through, whatever was already collected is kept.
+    max_results: int = Field(default=INITIAL_BATCH, ge=1, le=MAX_RESULTS)
     fetch_abstracts: bool = False
-    # Defaults to the official API. Google Scholar is opt-in.
+    # Every provider runs on every search now -- see providers.DEFAULT_PROVIDERS.
     providers: list[str] = Field(default_factory=lambda: list(DEFAULT_PROVIDERS))
 
 
@@ -99,6 +101,7 @@ def get_config() -> dict:
     from . import openalex
     return {
         "max_results": MAX_RESULTS,
+        "initial_batch": INITIAL_BATCH,
         "page_batch": PAGE_BATCH,
         "default_providers": list(DEFAULT_PROVIDERS),
         "providers": PROVIDER_LABELS,
