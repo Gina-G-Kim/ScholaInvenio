@@ -254,15 +254,47 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 /* ---------------- busy overlay ---------------- */
 .busy {
   position: fixed; inset: 0; background: rgba(10,12,16,.72);
-  display: flex; align-items: center; justify-content: center; gap: 12px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
   z-index: 60; font-size: 14px; backdrop-filter: blur(2px);
 }
-.spinner {
-  width: 22px; height: 22px; border-radius: 50%;
-  border: 3px solid #35405a; border-top-color: var(--accent);
-  animation: spin .8s linear infinite;
+.gauge { width: 220px; height: 7px; border-radius: 4px; background: #232838; overflow: hidden; }
+.gauge-fill {
+  height: 100%; width: 0; border-radius: 4px;
+  background: linear-gradient(90deg, var(--accent2), var(--accent));
 }
-@keyframes spin { to { transform: rotate(360deg); } }
+/* #busy's gauge tracks real elapsed time (see busy()/updateBusyStatus() in
+   app.js) -- there's no true percentage for an in-flight fetch, but a width
+   that actually grows with how long it's been waiting reads as real status,
+   not decoration unrelated to what's happening. */
+#busy .gauge-fill { transition: width .3s linear; }
+/* The scroll-triggered gauge finishes in a couple seconds with nothing
+   meaningful to report yet, so it stays a plain indeterminate loop. */
+.scroll-loading .gauge-fill { animation: gauge-loop 1.2s ease-in-out infinite; }
+@keyframes gauge-loop {
+  0%   { width: 0%; }
+  65%  { width: 100%; }
+  85%  { width: 100%; }
+  100% { width: 0%; }
+}
+
+/* Smaller version of the same gauge, inline at the bottom of a scrolled
+   list -- present in the DOM for as long as a background batch is being
+   fetched (see fetchMore in app.js), but only actually shown (.visible)
+   while the list is scrolled near its bottom; scrolling away slides it back
+   out of view (still loading behind the scenes) instead of leaving it
+   pinned in the way. */
+.scroll-loading {
+  position: sticky; bottom: 0; left: 0; right: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 10px 12px 8px;
+  background: linear-gradient(to top, var(--bg) 55%, transparent);
+  transform: translateY(100%);
+  opacity: 0;
+  transition: transform .25s ease, opacity .2s ease;
+  pointer-events: none;
+}
+.scroll-loading.visible { transform: translateY(0); opacity: 1; }
+.scroll-loading .gauge { width: 110px; height: 5px; }
 
 @media (max-width: 900px) {
   .detail { flex-basis: 300px; width: 300px; }
@@ -295,13 +327,6 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .col-sort select {
   flex: 1; min-width: 0; padding: 3px 6px; font-size: 10.5px; font-family: inherit;
   background: var(--panel2); color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
-}
-
-/* ---------------- scroll-triggered "load more" row ---------------- */
-/* spec 7 update: more is fetched automatically near the bottom of the
-   list, appended in place -- no more manual button/bubble. */
-.item-loading {
-  padding: 10px 12px; font-size: 11.5px; text-align: center; color: var(--muted);
 }
 
 /* ---------------- session deletion ---------------- */

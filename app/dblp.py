@@ -32,12 +32,23 @@ what one misses, the other tends to have.
   - Mirrored at dblp.org and dblp.uni-trier.de (same organization); the
     primary domain has been seen returning transient 5xxs, so a request
     falls back to the mirror before giving up.
+
+Continuation: each independent query ("bucket" below -- one matched venue,
+or the plain keyword fallback, times one year if a bounded range applies)
+tracks its own DBLP `f=` offset and whether it's been exhausted. That state
+round-trips as an opaque JSON cursor string, the same role OpenAlex's cursor
+plays -- without it, a round whose other providers had nothing left to add
+would report has_more=False forever after its first batch, regardless of
+how much more DBLP actually has (confirmed live: a round where OpenAlex was
+already exhausted and Scholar had failed got permanently stuck at DBLP's
+first 50, with no way to reach the rest).
 """
 
 from __future__ import annotations
 
 import asyncio
 import html
+import json
 import re
 from datetime import datetime
 
@@ -51,7 +62,7 @@ from .venue_match import looks_like_same_venue
 HOSTS = ("https://dblp.org", "https://dblp.uni-trier.de")
 PAGE_SIZE = 100          # confirmed ceiling regardless of the requested `h`
 REQUEST_PAUSE = 1.0      # seconds between our own paginated requests
-MAX_PAGES = 10           # safety valve: at most 1,000 works examined per query
+MAX_PAGES = 10           # safety valve: at most 1,000 works examined per request
 # DBLP's `year:` facet only takes one exact year -- confirmed 'year:2024-2026:'
 # is read as a single literal value, not a range, and returns nothing. A
 # bounded year_from/year_to is instead queried one year at a time natively;
@@ -112,8 +123,8 @@ async def resolve_venue(session: AsyncSession, name: str) -> list[tuple[str, str
     with no year or edition number, so venue_match.looks_like_same_venue can
     tell a same-family workshop from a sister venue the same way it does for
     OpenAlex. But neither that string nor the acronym is trusted on its own
-    to fetch papers -- see _fetch_venue_papers and the module docstring for
-    why. The stream key is what actually confirms a paper belongs here.
+    to fetch papers -- see the module docstring for why. The stream key is
+    what actually confirms a paper belongs here.
     """
     data = await _get(session, "/search/venue/api", {"q": name, "h": "20"})
     hits = ((data.get("result") or {}).get("hits") or {}).get("hit") or []
@@ -220,70 +231,110 @@ def _year_list(year_from: int | None, year_to: int | None) -> list[int] | None:
     return list(range(lo, hi + 1))
 
 
-async def _fetch_publ(session: AsyncSession, q: str, cap: int) -> list[dict]:
-    collected: list[dict] = []
-    offset = 0
+# --------------------------------------------------------------------------- #
+# Buckets: one independent, resumable DBLP query each (one matched venue, or
+# the plain-keyword fallback, times one year if a bounded range applies).
+# Plain dicts, not a dataclass, so a list of them round-trips through
+# json.dumps/loads directly as the cursor.
+# --------------------------------------------------------------------------- #
+def _bucket_query(b: dict) -> str:
+    parts = list(b["base"]) + list(b["venue_words"])
+    if b.get("year") is not None:
+        parts.append(f"year:{b['year']}:")
+    return " ".join(parts)
+
+
+def _new_bucket(base_words, venue_words, year, stream, *, acronym_based=False, display="") -> dict:
+    return {
+        "base": base_words, "venue_words": venue_words, "year": year,
+        "stream": stream, "off": 0, "done": False, "buffer": [],
+        "acronym_based": acronym_based, "display": display,
+    }
+
+
+def _bucket_live(b: dict) -> bool:
+    """False once a bucket is both exhausted at DBLP and has nothing left
+    buffered locally -- see _fetch_bucket_page for why a "done" bucket can
+    still be holding unreturned hits."""
+    return not b["done"] or bool(b.get("buffer"))
+
+
+def _build_initial_buckets(
+    base_words: list[str], venue_name: str, venues: list[tuple[str, str, str]], years: list[int] | None
+) -> list[dict]:
+    buckets: list[dict] = []
+    if venues:
+        # A broad name like 'USENIX' can resolve to several real, distinct
+        # venues -- each gets its own bucket so one doesn't crowd out the
+        # rest once budgets are split, same reasoning as OpenAlex's per-source cap.
+        for stream, display, acronym in venues:
+            venue_words = [f"venue:{acronym}:"] if acronym else display.split()
+            for y in (years or [None]):
+                buckets.append(_new_bucket(
+                    base_words, venue_words, y, stream, acronym_based=bool(acronym), display=display,
+                ))
+    else:
+        venue_words = venue_name.split() if venue_name else []
+        for y in (years or [None]):
+            buckets.append(_new_bucket(base_words, venue_words, y, None))
+    return buckets
+
+
+def _encode_cursor(buckets: list[dict]) -> str | None:
+    if not any(_bucket_live(b) for b in buckets):
+        return None
+    return json.dumps({"buckets": buckets})
+
+
+def _decode_cursor(cursor: str) -> list[dict]:
+    try:
+        return json.loads(cursor).get("buckets") or []
+    except (ValueError, AttributeError):
+        return []
+
+
+async def _fetch_bucket_page(session: AsyncSession, bucket: dict, cap: int) -> list[dict]:
+    """Up to `cap` more raw hits for one bucket, resuming from its own
+    stored DBLP offset.
+
+    DBLP only pages in fixed PAGE_SIZE blocks -- confirmed a smaller `h`
+    doesn't shrink it -- so a call whose cap falls in the middle of a block
+    still has to fetch the whole block. Whatever comes back past `cap` is
+    kept in the bucket's own buffer instead of being dropped: since `off`
+    only ever moves forward past what DBLP actually sent, silently
+    discarding the overflow here would permanently skip it -- no future
+    continuation would ever ask for that range again. Mutates the bucket's
+    off/done/buffer in place.
+    """
+    if cap <= 0:
+        return []
+    out: list[dict] = list(bucket.get("buffer") or [])
     for page in range(MAX_PAGES):
-        if len(collected) >= cap:
+        if len(out) >= cap or bucket["done"]:
             break
-        data = await _get(session, "/search/publ/api", {
-            "q": q, "h": str(PAGE_SIZE), "f": str(offset),
-        })
+        if page:
+            await asyncio.sleep(REQUEST_PAUSE)
+        data = await _get(
+            session, "/search/publ/api",
+            {"q": _bucket_query(bucket), "h": str(PAGE_SIZE), "f": str(bucket["off"])},
+        )
         hits = ((data.get("result") or {}).get("hits") or {}).get("hit") or []
         if not hits:
+            bucket["done"] = True
             break
-        collected.extend(h.get("info") or {} for h in hits)
+        out.extend(h.get("info") or {} for h in hits)
         sent = int(((data.get("result") or {}).get("hits") or {}).get("@sent") or len(hits))
+        bucket["off"] += sent
         if sent < PAGE_SIZE:
-            break
-        offset += PAGE_SIZE
-        if page < MAX_PAGES - 1:
-            await asyncio.sleep(REQUEST_PAUSE)
-    return collected[:cap]
+            bucket["done"] = True
+    bucket["buffer"] = out[cap:]
+    return out[:cap]
 
 
-async def _fetch_venue_papers(
-    session: AsyncSession,
-    stream: str,
-    display: str,
-    acronym: str,
-    base_words: list[str],
-    years: list[int] | None,
-    cap: int,
-) -> list[dict]:
-    """One matched venue's papers, found by whichever recall query actually works.
-
-    Confirmed directly, for two real venues: DBLP's per-paper `venue` field
-    is sometimes the long descriptive name (USENIX Security Symposium) and
-    sometimes just a bare acronym (IEEE RE's papers all say 'RE', not the
-    long name /search/venue/api returns for it) -- with no way to know which
-    ahead of time. A `venue:<acronym>:` facet query only works for the
-    latter case (using the long name there found 1 paper out of ~2,000; the
-    acronym found all of them), so the acronym is tried first when DBLP
-    offers one, and the long name is only tried as a second pass if that
-    didn't turn up much -- typically one request per venue, not a fixed two.
-    Either way, only the stream-key prefix on each hit's own `key` decides
-    what actually counts as this venue; both queries are pure recall.
-    """
-    async def fetch_variant(extra_words: list[str]) -> list[dict]:
-        hits: list[dict] = []
-        for i, y in enumerate(years or [None]):
-            if i:
-                await asyncio.sleep(REQUEST_PAUSE)
-            q = " ".join(base_words + extra_words + ([f"year:{y}:"] if y is not None else []))
-            hits.extend(await _fetch_publ(session, q, cap))
-        return [info for info in hits if (info.get("key") or "").startswith(f"{stream}/")]
-
-    result: list[dict] = []
-    if acronym:
-        result = await fetch_variant([f"venue:{acronym}:"])
-    if len(result) < 5 and display:
-        if acronym:
-            await asyncio.sleep(REQUEST_PAUSE)
-        more = await fetch_variant(display.split())
-        seen_keys = {info.get("key") for info in result}
-        result.extend(info for info in more if info.get("key") not in seen_keys)
-    return result[:cap]
+def _matches_bucket(info: dict, bucket: dict) -> bool:
+    if not bucket["stream"]:
+        return True
+    return (info.get("key") or "").startswith(f"{bucket['stream']}/")
 
 
 async def search(
@@ -292,53 +343,67 @@ async def search(
     year_from: int | None = None,
     year_to: int | None = None,
     scope: str = "all",
-) -> tuple[list[Paper], str]:
-    """Returns (papers, note). No cursor/load-more support (see module docstring)."""
-    free, author_words, venue_name = _recall_terms(query)
-    if not free and not author_words and not venue_name:
-        return [], ""
-
-    years = _year_list(year_from, year_to)
+    cursor: str | None = None,
+) -> tuple[list[Paper], str, str | None]:
+    """Returns (papers, note, next cursor). See the module docstring for what
+    the cursor actually tracks and why DBLP needs one of its own."""
     note = ""
-    venues: list[tuple[str, str, str]] = []  # (stream key, display name, acronym)
     async with AsyncSession() as session:
-        if venue_name:
-            try:
-                venues = await resolve_venue(session, venue_name)
-            except DblpError as exc:
-                return [], f"DBLP venue lookup failed: {exc}"
-            if venues:
-                note = f"venue '{venue_name}' -> DBLP: " + ", ".join(d for _, d, _ in venues)
-            else:
-                note = f"could not find venue '{venue_name}' on DBLP; searched by keyword instead."
+        if cursor:
+            buckets = _decode_cursor(cursor)
+            if not buckets:
+                return [], "", None
+        else:
+            free, author_words, venue_name = _recall_terms(query)
+            if not free and not author_words and not venue_name:
+                return [], "", None
 
-        base_words = list(free)
-        if author_words:
-            base_words.append("author:" + " ".join(author_words) + ":")
+            years = _year_list(year_from, year_to)
+            venues: list[tuple[str, str, str]] = []
+            if venue_name:
+                try:
+                    venues = await resolve_venue(session, venue_name)
+                except DblpError as exc:
+                    return [], f"DBLP venue lookup failed: {exc}", None
+                if venues:
+                    note = f"venue '{venue_name}' -> DBLP: " + ", ".join(d for _, d, _ in venues)
+                else:
+                    note = f"could not find venue '{venue_name}' on DBLP; searched by keyword instead."
+
+            base_words = list(free)
+            if author_words:
+                base_words.append("author:" + " ".join(author_words) + ":")
+
+            buckets = _build_initial_buckets(base_words, venue_name, venues, years)
+
+        active = [b for b in buckets if _bucket_live(b)]
+        cap_each = max(10, max_results // len(active)) if active else max_results
 
         raw_hits: list[dict] = []
-        if venues:
-            # A broad name like 'USENIX' can resolve to several real, distinct
-            # venues -- split the budget so one doesn't crowd out the rest,
-            # same reasoning as OpenAlex's per-source cap.
-            cap_each = max(10, max_results // len(venues))
-            for i, (stream, display, acronym) in enumerate(venues):
-                if i:
-                    await asyncio.sleep(REQUEST_PAUSE)
-                raw_hits.extend(await _fetch_venue_papers(
-                    session, stream, display, acronym, base_words, years, cap_each
-                ))
-        else:
-            # No venue resolved (or none asked for) -- best-effort keyword
-            # search only; nothing to check a stream key against.
-            words = list(base_words)
-            if venue_name:
-                words.extend(venue_name.split())
-            for i, y in enumerate(years or [None]):
-                if i:
-                    await asyncio.sleep(REQUEST_PAUSE)
-                q = " ".join(words + ([f"year:{y}:"] if y is not None else []))
-                raw_hits.extend(await _fetch_publ(session, q, max_results))
+        first = True
+        for bucket in active:
+            if not first:
+                await asyncio.sleep(REQUEST_PAUSE)
+            first = False
+            untouched = bucket["off"] == 0
+            fetched = await _fetch_bucket_page(session, bucket, cap_each)
+            matched = [info for info in fetched if _matches_bucket(info, bucket)]
+            raw_hits.extend(matched)
+
+            # A thin acronym-only bucket gets a display-name-words sibling on
+            # its very first page (not on later continuations of the same
+            # bucket -- by then it's already known to be the right query, it
+            # just legitimately has fewer than 5 papers left in this batch).
+            # See the class docstring above _new_bucket's callers for why
+            # neither signal is trusted alone.
+            if untouched and bucket["acronym_based"] and len(matched) < 5 and bucket["display"]:
+                sibling = _new_bucket(bucket["base"], bucket["display"].split(), bucket["year"], bucket["stream"])
+                await asyncio.sleep(REQUEST_PAUSE)
+                more = await _fetch_bucket_page(session, sibling, cap_each)
+                more_matched = [info for info in more if _matches_bucket(info, sibling)]
+                seen_keys = {info.get("key") for info in matched}
+                raw_hits.extend(info for info in more_matched if info.get("key") not in seen_keys)
+                buckets.append(sibling)
 
     papers: list[Paper] = []
     seen: set[str] = set()
@@ -351,4 +416,4 @@ async def search(
         seen.add(paper.id)
         papers.append(paper)
 
-    return papers[:max_results], note
+    return papers[:max_results], note, _encode_cursor(buckets)

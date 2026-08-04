@@ -18,6 +18,7 @@ const state = {
   // if only DBLP is hidden).
   hiddenSources: new Set(),
   loadingMore: new Set(),     // round numbers currently mid-background-fetch
+  fetchPace: {},              // round number -> { batch, endedAt, tookMs } -- see fetchMore's batch sizing
 };
 
 const PROVIDER_LABELS = { openalex: "OpenAlex", gscholar: "Google Scholar", dblp: "DBLP" };
@@ -53,14 +54,53 @@ async function api(path, options = {}) {
   try { payload = text ? JSON.parse(text) : null; } catch { payload = null; }
   if (!res.ok) {
     const msg = (payload && (payload.detail || payload.message)) || text || `HTTP ${res.status}`;
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   return payload;
 }
 
+/* The gauge tracks real elapsed time instead of looping on its own --
+   there's no true percentage for an in-flight fetch, but a width that
+   actually grows with how long it's been waiting (plus the elapsed seconds
+   in the label) reads as real status, not decoration unrelated to what's
+   actually happening. Google Scholar's own per-result delay (see
+   gscholar.py) is what usually makes this run long, so that's called out
+   once it's been a while, rather than leaving it looking stuck. */
+let busyTimer = null;
+let busyStart = 0;
+let busyLabel = "";
+
 function busy(on, label) {
-  $("#busy").classList.toggle("hidden", !on);
-  if (label) $("#busyText").textContent = label;
+  const box = $("#busy");
+  box.classList.toggle("hidden", !on);
+  clearInterval(busyTimer);
+  busyTimer = null;
+  if (on) {
+    busyStart = Date.now();
+    busyLabel = label || "Working…";
+    updateBusyStatus();
+    busyTimer = setInterval(updateBusyStatus, 1000);
+  } else {
+    const fill = box.querySelector(".gauge-fill");
+    if (fill) fill.style.width = "0%";
+  }
+}
+
+function updateBusyStatus() {
+  const elapsed = Math.max(0, Math.round((Date.now() - busyStart) / 1000));
+  const fill = document.querySelector("#busy .gauge-fill");
+  if (fill) {
+    // Asymptotic, not linear -- there's no real total to divide by, so this
+    // keeps growing but ever more slowly, reading as "still working" rather
+    // than implying a fixed ETA it then blows past.
+    fill.style.width = `${Math.min(92, 100 * (1 - Math.exp(-elapsed / 8)))}%`;
+  }
+  let text = busyLabel;
+  if (elapsed >= 1) text += ` (${elapsed}s)`;
+  if (elapsed >= 15) text += " — Google Scholar can take the longest of the three, hang tight.";
+  $("#busyText").textContent = text;
 }
 
 let bannerTimer = null;
@@ -217,30 +257,158 @@ function goHome() {
 /* Load more -- fetched automatically as the list is scrolled, in the  */
 /* background, rather than a manual "load more" button (spec 7 update) */
 /* ------------------------------------------------------------------ */
+// Scaled to the list's own visible height rather than a fixed pixel count,
+// so the prefetch starts a consistent "about one screen's worth" early
+// regardless of row height or window size -- fetching only starts once
+// you're within one clientHeight of the bottom, well before you can
+// actually get there, so on ordinary scroll speeds the batch has already
+// landed by the time you arrive and there's nothing to wait for.
+const PREFETCH_SCREENS = 1;
+
+function distanceFromBottom(listEl) {
+  return listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight;
+}
+
+function pastPrefetchThreshold(listEl) {
+  return distanceFromBottom(listEl) < listEl.clientHeight * PREFETCH_SCREENS;
+}
+
+// Not "close" -- physically can't scroll any further. Separate from the
+// prefetch trigger above on purpose: prefetching should stay invisible
+// under normal scrolling, and only surface the loading gauge for the
+// (fast-scroll) case where you actually outrun it and hit the true edge
+// while it's still in flight.
+function isAtBottom(listEl) {
+  return distanceFromBottom(listEl) <= 2;
+}
+
+/* The loading gauge is only ever meant to be looked at while you're at the
+   bottom checking on it -- if you scroll back up mid-fetch to read
+   something, it retracts out of view (still loading in the background,
+   nothing pinned in your way) and slides back in if you return to the
+   bottom before it finishes. It stays in the DOM the whole time; only a
+   class toggles, so this never fights with patchColumnAppend/removeLoadingRow. */
+function setLoadingRowVisible(listEl, visible) {
+  listEl.querySelector(".scroll-loading")?.classList.toggle("visible", visible);
+}
+
+function removeLoadingRow(listEl) {
+  const row = listEl.querySelector(".scroll-loading");
+  if (!row) return;
+  row.classList.remove("visible");
+  setTimeout(() => row.remove(), 260);   // matches the CSS slide-down transition
+}
+
+/* A round whose results don't fill the visible list at all has nothing to
+   scroll -- 'scroll' never fires, so maybeLoadMore would never get a
+   chance to run (confirmed: a query only OpenAlex answered, with DBLP and
+   Scholar both down, left a 5-result list far shorter than the column,
+   permanently stuck). This drives the same fetch without waiting for a
+   scroll event whenever that's the situation. Stops on its own once either
+   the list actually overflows or a fetch adds nothing new. */
+function checkAutoLoadMore(round, listEl) {
+  if (!round.has_more || state.loadingMore.has(round.number)) return;
+  if (listEl.scrollHeight > listEl.clientHeight + 2) return;   // already scrollable -- let the user drive it
+  fetchMore(round.number, { silent: true });
+}
+
+/* Appends only the newly-fetched papers to an already-rendered list,
+   in place, instead of the usual full render() teardown-and-rebuild.
+   This matters specifically because the fetch is triggered *while the
+   user is still scrolling* -- a real (trackpad/wheel) scroll gesture is
+   still in flight at that moment, and replacing the very element the
+   gesture is scrolling out from under it (render() wipes and rebuilds
+   #columns from scratch) drops the rest of that gesture, which is
+   exactly what made this feel broken. */
+function patchColumnAppend(round, previousRound, listEl) {
+  const alreadyShown = new Set(previousRound.papers.map((p) => p.id));
+  for (const paper of visiblePapers(round.papers)) {
+    if (!alreadyShown.has(paper.id)) listEl.append(buildItem(round, paper));
+  }
+  const countEl = listEl.closest(".col")?.querySelector(".col-count");
+  if (countEl) {
+    const shownCount = visiblePapers(round.papers).length;
+    countEl.textContent = shownCount === round.count ? `${round.count}` : `${shownCount} of ${round.count}`;
+  }
+}
+
+// If the previous fetch for this round is still within its own duration
+// (i.e. the next batch was already needed before the last one even had time
+// to be requested again), scrolling is outrunning the default batch size --
+// the next call asks for more up front so a long fast scroll settles into
+// fewer, bigger requests instead of a rapid chain of small ones. A calmer
+// gap resets back to the configured default, since ordinary browsing should
+// stay on small, quick calls rather than always over-fetching.
+const MAX_BATCH_MULTIPLIER = 8;
+
+function nextBatchSize(number) {
+  const pace = state.fetchPace[number];
+  const base = state.config.page_batch;
+  if (!pace || performance.now() - pace.endedAt >= pace.tookMs) return base;
+  return Math.min(pace.batch * 2, base * MAX_BATCH_MULTIPLIER);
+}
+
 async function fetchMore(number, { silent = false } = {}) {
   if (state.loadingMore.has(number)) return;   // already fetching this round
   state.loadingMore.add(number);
   if (!silent) busy(true, "Fetching more…");
-  render();   // shows the inline "loading more…" row at the bottom of the list
+
+  // In-place patching only works for the default (fetch/relevance) order --
+  // any other sort needs the whole list re-ordered, not just appended to.
+  const patchable = (state.sorts[number] || "relevance") === "relevance";
+  let listEl = patchable ? document.querySelector(`.col-list[data-round="${number}"]`) : null;
+  if (listEl) {
+    const row = buildLoadingRow();
+    // Only surface it if you're already at the true bottom waiting -- see
+    // pastPrefetchThreshold/isAtBottom above for why this normally starts
+    // well before that and finishes invisibly.
+    if (isAtBottom(listEl)) row.classList.add("visible");
+    listEl.append(row);
+  } else {
+    render();
+  }
+
+  const batch = nextBatchSize(number);
+  const startedAt = performance.now();
   try {
-    const out = await api(`/api/session/${state.sessionId}/round/${number}/more`, { method: "POST" });
+    const out = await api(`/api/session/${state.sessionId}/round/${number}/more`, {
+      method: "POST",
+      body: JSON.stringify({ batch }),
+    });
+    state.fetchPace[number] = { batch, endedAt: performance.now(), tookMs: performance.now() - startedAt };
     const idx = state.rounds.findIndex((r) => r.number === number);
+    const previousRound = idx >= 0 ? state.rounds[idx] : null;
     if (idx >= 0) state.rounds[idx] = out.round;
     // rounds derived from this one were deleted by the server.
-    if (out.dropped_rounds && out.dropped_rounds.length) {
+    const dropped = out.dropped_rounds && out.dropped_rounds.length;
+    if (dropped) {
       state.rounds = state.rounds.filter((r) => !out.dropped_rounds.includes(r.number));
     }
     state.loadingMore.delete(number);
-    render();
+
+    listEl = patchable && !dropped ? document.querySelector(`.col-list[data-round="${number}"]`) : null;
+    if (listEl && previousRound) {
+      removeLoadingRow(listEl);
+      patchColumnAppend(out.round, previousRound, listEl);
+      if (out.added > 0) checkAutoLoadMore(out.round, listEl);
+    } else {
+      render();
+    }
+
     if (!silent) {
-      const dropped = out.dropped_rounds && out.dropped_rounds.length
+      const droppedMsg = dropped
         ? ` Later rounds (${out.dropped_rounds.join(", ")}) were removed since their basis changed.` : "";
-      banner(`+${out.added} results — ${out.round.count} total, saved to round_${String(number).padStart(2,"0")}.xml.${dropped}`,
+      banner(`+${out.added} results — ${out.round.count} total, saved to round_${String(number).padStart(2,"0")}.xml.${droppedMsg}`,
              "ok", 12000);
     }
   } catch (err) {
     state.loadingMore.delete(number);
-    render();
+    const stillThere = patchable ? document.querySelector(`.col-list[data-round="${number}"]`) : null;
+    if (stillThere) {
+      removeLoadingRow(stillThere);
+    } else {
+      render();
+    }
     // A background fetch failing quietly is better than interrupting
     // scrolling -- has_more is untouched, so the next scroll near the
     // bottom just tries again.
@@ -377,12 +545,51 @@ function render(scrollToEnd = false) {
     requestAnimationFrame(() => { wrap.scrollLeft = wrap.scrollWidth; });
   }
   renderDetail(currentPaper());
+
+  // A round short enough to not overflow its own column has nothing to
+  // scroll, so the listener above would never get a chance to fire --
+  // drive the same fetch directly instead of leaving it stuck.
+  state.rounds.forEach((round) => {
+    const list = wrap.querySelector(`.col-list[data-round="${round.number}"]`);
+    if (list) checkAutoLoadMore(round, list);
+  });
 }
 
 function visiblePapers(papers) {
   if (!state.hiddenSources.size) return papers;
   // hidden only once *every* source that found this paper is hidden
   return papers.filter((p) => !(p.sources || []).every((s) => state.hiddenSources.has(s)));
+}
+
+function buildItem(round, paper) {
+  const item = el("div", "item");
+  if (paper.sources && paper.sources.length) {
+    const srcs = el("span", "srcs");
+    paper.sources.forEach((name) => {
+      srcs.append(el("span", `srcbadge ${name}`, PROVIDER_SHORT[name] || name));
+    });
+    item.append(srcs);
+  }
+  if (paper.year) item.append(el("span", "yr", `${paper.year}`));
+  item.append(document.createTextNode(paper.title));
+  if (state.selected && state.selected.round === round.number && state.selected.paperId === paper.id) {
+    item.classList.add("active");
+  }
+  item.addEventListener("click", () => {
+    state.selected = { round: round.number, paperId: paper.id };
+    document.querySelectorAll(".item.active").forEach((n) => n.classList.remove("active"));
+    item.classList.add("active");
+    renderDetail(paper);
+  });
+  return item;
+}
+
+function buildLoadingRow() {
+  const loadingRow = el("div", "scroll-loading");
+  const gauge = el("div", "gauge");
+  gauge.append(el("div", "gauge-fill"));
+  loadingRow.append(gauge);
+  return loadingRow;
 }
 
 function buildColumn(round, isLast) {
@@ -451,13 +658,16 @@ function buildColumn(round, isLast) {
   const list = el("div", "col-list");
   list.dataset.round = String(round.number);
 
-  // Beyond the first batch, more is fetched automatically as this list is
-  // scrolled near its bottom, instead of a manual "load more" prompt.
-  const SCROLL_FETCH_THRESHOLD = 300; // px from the bottom
+  // Beyond the first batch, more is fetched automatically well before this
+  // list is scrolled to its actual bottom (see pastPrefetchThreshold), so it
+  // normally finishes before you get there. The loading gauge only shows up
+  // if you outscroll it and hit the true bottom (isAtBottom) while it's
+  // still in flight -- fetchMore's own trigger order matters here (start the
+  // fetch first) so a fetch that begins right at the true edge shows the
+  // gauge immediately instead of on the next scroll tick.
   list.addEventListener("scroll", () => {
-    if (list.scrollHeight - list.scrollTop - list.clientHeight < SCROLL_FETCH_THRESHOLD) {
-      maybeLoadMore(round);
-    }
+    if (pastPrefetchThreshold(list)) maybeLoadMore(round);
+    setLoadingRowVisible(list, isAtBottom(list));
   });
 
   if (!shown.length) {
@@ -467,33 +677,15 @@ function buildColumn(round, isLast) {
   const cmp = (SORTS[state.sorts[round.number] || "relevance"] || {}).cmp;
   const ordered = cmp ? [...shown].sort(cmp) : shown;
   for (const paper of ordered) {
-    const item = el("div", "item");
-    if (paper.sources && paper.sources.length) {
-      const srcs = el("span", "srcs");
-      paper.sources.forEach((name) => {
-        srcs.append(el("span", `srcbadge ${name}`, PROVIDER_SHORT[name] || name));
-      });
-      item.append(srcs);
-    }
-    if (paper.year) item.append(el("span", "yr", `${paper.year}`));
-    item.append(document.createTextNode(paper.title));
-    if (state.selected && state.selected.round === round.number && state.selected.paperId === paper.id) {
-      item.classList.add("active");
-    }
-    item.addEventListener("click", () => {
-      state.selected = { round: round.number, paperId: paper.id };
-      document.querySelectorAll(".item.active").forEach((n) => n.classList.remove("active"));
-      item.classList.add("active");
-      renderDetail(paper);
-    });
-    list.append(item);
+    list.append(buildItem(round, paper));
   }
+  // Shown only while a background batch is actually in flight -- nothing
+  // sits at the bottom of the list otherwise, so scrolling near it and then
+  // stopping (no more to fetch, or already caught up) leaves just the list.
   if (state.loadingMore.has(round.number)) {
-    list.append(el("div", "item-loading", "Loading more…"));
-  } else if (round.has_more) {
-    // a quiet placeholder confirms there's more to scroll to, without
-    // prompting for a click the way the old "load more" bubble did
-    list.append(el("div", "item-loading muted", "Scroll for more…"));
+    const row = buildLoadingRow();
+    if (isAtBottom(list)) row.classList.add("visible");
+    list.append(row);
   }
   col.append(list);
 
@@ -694,7 +886,7 @@ async function showSessions() {
   }
 }
 
-async function loadSession(sessionId) {
+async function loadSession(sessionId, { isInitialLoad = false } = {}) {
   busy(true, "Loading session…");
   try {
     const out = await api(`/api/session/${sessionId}`);
@@ -710,7 +902,16 @@ async function loadSession(sessionId) {
     history.replaceState(null, "", `?session=${encodeURIComponent(out.id)}`);
     render(true);
   } catch (err) {
-    banner(err.message);
+    if (isInitialLoad && err.status === 404) {
+      // The URL still names a session from an earlier visit (bookmark, a
+      // stale tab left open) that's since been deleted -- greeting a user
+      // who hasn't done anything yet with a red error is worse than just
+      // quietly landing on the normal empty state.
+      history.replaceState(null, "", location.pathname);
+      render();
+    } else {
+      banner(err.message);
+    }
   } finally {
     busy(false);
   }
@@ -755,7 +956,7 @@ api("/api/config").then((cfg) => {
 
 const initialSession = new URLSearchParams(location.search).get("session");
 if (initialSession) {
-  loadSession(initialSession);
+  loadSession(initialSession, { isInitialLoad: true });
 } else {
   render();
 }

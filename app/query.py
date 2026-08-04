@@ -87,6 +87,13 @@ def _scan(text: str) -> Iterator[Term]:
         if m:
             fname = _FIELD_ALIAS.get(m.group(1).lower(), m.group(1).lower())
             i = m.end()
+            # A minus right after the colon (source:-IOP) reads just as
+            # naturally as one in front of the whole term (-source:IOP) --
+            # field:value is one visual unit, so the exclude mark commonly
+            # ends up on the value itself. Accept either.
+            if not negated and i < n and text[i] == "-" and i + 1 < n and not text[i + 1].isspace():
+                negated = True
+                i += 1
 
         if i < n and text[i] == '"':
             i += 1
@@ -162,6 +169,23 @@ def split_source_terms(text: str) -> tuple[str, str]:
             continue
         remaining.append(node)
     return render_query(remaining), " ".join(source_only)
+
+
+def negated_source_terms(text: str) -> str:
+    """Just the negated source: terms, rendered back to query syntax.
+
+    A positive source: term (a venue to search *within*) is deliberately
+    left out -- callers that already verify that some other, more reliable
+    way (DBLP's own stream-key match, see dblp.py) re-check this instead of
+    that. But a negated source: term (a venue to exclude) is a different
+    claim entirely, one nothing upstream already enforces, so it still needs
+    a local recheck of its own even when the positive case doesn't.
+    """
+    out: list[str] = []
+    for node in parse_query(text):
+        if isinstance(node, Term) and node.field == "source" and node.negated:
+            out.append(node.render())
+    return " ".join(out)
 
 
 def source_only_words(text: str) -> str:

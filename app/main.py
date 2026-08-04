@@ -72,6 +72,15 @@ class SearchIn(BaseModel):
     providers: list[str] = Field(default_factory=lambda: list(DEFAULT_PROVIDERS))
 
 
+class FetchMoreIn(BaseModel):
+    # The GUI grows this on its own past the default once it notices batches
+    # are being requested back-to-back (see app.js's nextBatchSize) -- a long
+    # fast scroll settles into fewer, larger calls instead of a rapid chain
+    # of small ones, each paying the same per-request provider overhead
+    # (DBLP's crawl-delay pacing, Scholar's per-item sleep).
+    batch: int = Field(default=PAGE_BATCH, ge=PAGE_BATCH, le=MAX_RESULTS)
+
+
 class RefineIn(BaseModel):
     query: str = ""
     scope: str = SCOPE_TITLE_ABSTRACT
@@ -238,7 +247,7 @@ async def run_search(body: SearchIn) -> JSONResponse:
 
 
 @app.post("/api/session/{session_id}/round/{number}/more")
-async def fetch_more(session_id: str, number: int) -> JSONResponse:
+async def fetch_more(session_id: str, number: int, body: FetchMoreIn = FetchMoreIn()) -> JSONResponse:
     """Fetch another batch and **append it to the same round's XML**.
 
     Resumes from the cursor each provider handed back, so results already
@@ -262,7 +271,7 @@ async def fetch_more(session_id: str, number: int) -> JSONResponse:
     results, notes, failed, cursors, totals = await gather_providers(
         providers=providers,
         query=rnd.query,
-        max_results=PAGE_BATCH,
+        max_results=body.batch,
         year_from=rnd.year_from,
         year_to=rnd.year_to,
         cursors=rnd.cursors,

@@ -23,7 +23,7 @@ from . import gscholar as gs
 from . import openalex as oa
 from .filters import apply_filter
 from .models import SCOPE_ALL, Paper
-from .query import source_only_words, split_source_terms
+from .query import negated_source_terms, source_only_words, split_source_terms
 
 OPENALEX = "openalex"
 GSCHOLAR = "gscholar"
@@ -119,30 +119,36 @@ async def search_dblp(
     year_from: int | None = None,
     year_to: int | None = None,
     fetch_abstracts: bool = False,
+    cursor: str | None = None,
 ):
-    papers, note = await db.search(query, max_results, year_from, year_to)
+    papers, note, next_cursor = await db.search(query, max_results, year_from, year_to, cursor=cursor)
     # DBLP's own search is fuzzy recall only (see dblp.py's module docstring)
     # -- the same local filter spec 5's refine search already uses re-checks
-    # the rest of the original query against what came back. source: is
-    # deliberately excluded from this pass: dblp.py already matched the venue
-    # by DBLP's own stream key (its equivalent of OpenAlex's source ID), which
-    # is reliable specifically *because* it doesn't depend on the venue's
-    # display text -- and that text is exactly what this word-substring check
-    # would have to use. Confirmed for IEEE RE: DBLP's own per-paper venue
-    # field is just the acronym 'RE', so checking the full typed name
-    # ('IEEE International Conference on Requirements Engineering') against
-    # it word-by-word would reject a paper the stream-key match already
-    # correctly confirmed.
+    # the rest of the original query against what came back. A *positive*
+    # source: term is deliberately excluded from this pass: dblp.py already
+    # matched the venue by DBLP's own stream key (its equivalent of OpenAlex's
+    # source ID), which is reliable specifically *because* it doesn't depend
+    # on the venue's display text -- and that text is exactly what this
+    # word-substring check would have to use. Confirmed for IEEE RE: DBLP's
+    # own per-paper venue field is just the acronym 'RE', so checking the
+    # full typed name ('IEEE International Conference on Requirements
+    # Engineering') against it word-by-word would reject a paper the
+    # stream-key match already correctly confirmed.
+    # A *negated* source: term (excluding some other venue) is the opposite
+    # case: nothing upstream verifies that, since DBLP can't exclude natively
+    # (dblp.py's own recall step drops negated terms entirely) -- so unlike
+    # the positive case, it still needs to be checked here.
     if papers:
         before = len(papers)
         non_source_query, _ = split_source_terms(query)
-        papers = apply_filter(papers, non_source_query, SCOPE_ALL, year_from, year_to)
+        recheck_query = f"{non_source_query} {negated_source_terms(query)}".strip()
+        papers = apply_filter(papers, recheck_query, SCOPE_ALL, year_from, year_to)
         if len(papers) != before:
             note = f"{note} kept {len(papers)} of {before} after locally re-verifying the query.".strip()
     if fetch_abstracts and papers:
         from .scholar import enrich_abstracts
         await enrich_abstracts(papers)
-    return papers, note, None, len(papers)
+    return papers, note, next_cursor, len(papers)
 
 
 async def gather_providers(
@@ -176,7 +182,7 @@ async def gather_providers(
             )
         if name == DBLP:
             return await search_dblp(
-                query, max_results, year_from, year_to, fetch_abstracts
+                query, max_results, year_from, year_to, fetch_abstracts, cursors.get(name)
             )
         raise ProviderError(f"unknown provider: {name}")
 
