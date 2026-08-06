@@ -234,7 +234,7 @@ async def resolve_sources(
     `alternate_titles`, so abbreviations are naturally handled by OpenAlex's
     own index — there's no need to maintain an abbreviation table here.
 
-    Three pitfalls are handled:
+    Four pitfalls are handled:
       1) search ANDs its tokens together. A full formal name like 'IEEE
          International Conference on Requirements Engineering' only matches
          records containing every one of those words, and OpenAlex commonly
@@ -259,6 +259,17 @@ async def resolve_sources(
          still appear somewhere in the match list and must not be allowed to
          dominate the filter just because it has more works than everything
          else combined.
+      4) A candidate can score well by text relevance without actually being
+         the same venue at all (confirmed live: searching 'The Web
+         Conference' matched AAAI's separately-run 'Web and Social Media'
+         conference and an ACM 'Web Search and Data Mining' conference,
+         neither of which is this one -- both just share the common words
+         'Web'/'Conference' and happened to outscore or sit close enough to
+         the real match that _drop_irrelevant's ratio cutoff let them
+         through). venue_match.looks_like_same_venue is the same check
+         _resolve_unlinked_editions already trusts for exactly this
+         decision, applied here too rather than relying on relevance score
+         alone to imply venue identity.
     """
     tokens = name.split()
     found: list[dict] = []
@@ -267,7 +278,9 @@ async def resolve_sources(
 
     for cut in range(0, max(len(tokens) - 1, 1)):
         candidate = " ".join(tokens[cut:])
-        batch = _drop_irrelevant(await _lookup_sources(session, candidate, min(limit, 50)))
+        batch = await _lookup_sources(session, candidate, min(limit, 50))
+        batch = [r for r in batch if looks_like_same_venue(r.get("display_name") or "", name)]
+        batch = _drop_irrelevant(batch)
         seen = {r.get("id") for r in found}
         found += [r for r in batch if r.get("id") not in seen]
         total = sum(r.get("works_count") or 0 for r in found)

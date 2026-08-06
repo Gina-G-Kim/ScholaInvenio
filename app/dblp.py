@@ -125,8 +125,18 @@ async def resolve_venue(session: AsyncSession, name: str) -> list[tuple[str, str
     OpenAlex. But neither that string nor the acronym is trusted on its own
     to fetch papers -- see the module docstring for why. The stream key is
     what actually confirms a paper belongs here.
+
+    Asks for many more hits than DBLP's own relevance ranking would suggest
+    are worth looking at (h=100, not a top handful): confirmed live, "The
+    Web Conference (WWW)" -- an exact, unambiguous match once it's actually
+    seen -- ranked 43rd out of 100 for the query "Web Conference", behind a
+    string of only loosely related "Semantic Web Conference"/"Web Services"
+    venues that just happen to share the same two very common words. DBLP's
+    own text relevance for a short, generic-sounding formal name isn't
+    reliable enough to trust a short list; looks_like_same_venue below is
+    what actually decides relevance, at whatever rank a match turns up.
     """
-    data = await _get(session, "/search/venue/api", {"q": name, "h": "20"})
+    data = await _get(session, "/search/venue/api", {"q": name, "h": "100"})
     hits = ((data.get("result") or {}).get("hits") or {}).get("hit") or []
     found: list[tuple[str, str, str]] = []
     seen: set[str] = set()
