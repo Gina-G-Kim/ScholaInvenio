@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 
 _LEADING_YEAR_RE = re.compile(r"^(19|20)\d{2}\s*[:\-–—]?\s*")
+_TRAILING_YEAR_RE = re.compile(r"\s*,?\s*(19|20)\d{2}\s*$")
 _TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
 _ORDINAL_RE = re.compile(r"\b\d+(?:st|nd|rd|th)\b", re.IGNORECASE)
 _STOPWORDS = {"the", "a", "an", "on", "of", "for", "in", "and", "proceedings"}
@@ -26,9 +27,24 @@ ALLOWED_EXTRA_TOKENS = {"workshop", "workshops"}
 
 
 def clean_venue_title(title: str) -> str:
-    """Strip a leading year and a trailing parenthetical acronym."""
+    """Strip a year (leading or trailing) and a trailing parenthetical acronym.
+
+    Different publishers put the edition year in different places -- IEEE's
+    convention leads with it ('2024 IEEE ... Conference'), ACM's trails it
+    ('Proceedings of the ACM Web Conference 2024'). Only the leading case was
+    handled here; a trailing year survived into venue_tokens() as a stray
+    extra token, which made looks_like_same_venue reject every year's own
+    edition of any venue named ACM's way (confirmed live: none of "ACM Web
+    Conference"'s yearly unlinked editions matched, each rejected over its
+    own trailing year). Strip both, repeating in case removing one exposes
+    the other (a trailing paren after a trailing year, or vice versa).
+    """
     t = _LEADING_YEAR_RE.sub("", title or "")
-    t = _TRAILING_PAREN_RE.sub("", t)
+    while True:
+        stripped = _TRAILING_YEAR_RE.sub("", _TRAILING_PAREN_RE.sub("", t))
+        if stripped == t:
+            break
+        t = stripped
     return t.strip()
 
 

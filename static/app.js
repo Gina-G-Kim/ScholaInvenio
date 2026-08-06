@@ -296,7 +296,27 @@ function removeLoadingRow(listEl) {
   const row = listEl.querySelector(".scroll-loading");
   if (!row) return;
   row.classList.remove("visible");
-  setTimeout(() => row.remove(), 260);   // matches the CSS slide-down transition
+  row._removeTimer = setTimeout(() => row.remove(), 260);   // matches the CSS slide-down transition
+}
+
+/* Get-or-create: reuses an existing row instead of appending a second one.
+   Without this, a fetch that chains straight into another (checkAutoLoadMore
+   firing right after a successful patch, the same tick removeLoadingRow's
+   own removal is still deferred in) appended a brand new row while the
+   previous one's slide-down animation hadn't actually removed it from the
+   DOM yet -- two rows, one list, confirmed live by scrolling up and down
+   repeatedly during a long background fetch. Cancels any pending removal
+   from a prior call so that timer can't yank the row out from under this
+   fetch once it eventually fires. */
+function ensureLoadingRow(listEl) {
+  let row = listEl.querySelector(".scroll-loading");
+  if (row) {
+    clearTimeout(row._removeTimer);
+  } else {
+    row = buildLoadingRow();
+  }
+  listEl.append(row);   // (re-)pin it at the very end, past any newly patched items
+  return row;
 }
 
 /* A round whose results don't fill the visible list at all has nothing to
@@ -358,12 +378,11 @@ async function fetchMore(number, { silent = false } = {}) {
   const patchable = (state.sorts[number] || "relevance") === "relevance";
   let listEl = patchable ? document.querySelector(`.col-list[data-round="${number}"]`) : null;
   if (listEl) {
-    const row = buildLoadingRow();
+    const row = ensureLoadingRow(listEl);
     // Only surface it if you're already at the true bottom waiting -- see
     // pastPrefetchThreshold/isAtBottom above for why this normally starts
     // well before that and finishes invisibly.
     if (isAtBottom(listEl)) row.classList.add("visible");
-    listEl.append(row);
   } else {
     render();
   }

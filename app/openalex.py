@@ -15,6 +15,7 @@ Confirmed against the official docs (developers.openalex.org):
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 
@@ -236,14 +237,22 @@ async def resolve_sources(
     Three pitfalls are handled:
       1) search ANDs its tokens together. A full formal name like 'IEEE
          International Conference on Requirements Engineering' only matches
-         records containing every one of those words, which usually means
-         only the conference proceedings itself, not the plain 'Requirements
-         Engineering' journal that's actually the more useful hit. One
-         dropped leading token isn't always enough. That name needs its
-         leading four words gone before the real journal appears at all, so
-         the leading token is dropped one at a time, in a loop, stopping as
-         soon as there's a solid match (or two words are all that's left,
-         since 'Engineering' alone matches thousands of unrelated venues).
+         records containing every one of those words, and OpenAlex commonly
+         splits the same conference across a couple of source records by
+         naming variant, so a single dropped leading token can be needed to
+         catch the second one. But relaxing indefinitely is dangerous: once
+         enough leading words are gone, what's left can be generic enough to
+         match completely unrelated fields (confirmed live: 'IEEE
+         International Requirements Engineering Conference' correctly
+         matches the real conference on the very first, full-length query --
+         only 14 works, since OpenAlex's coverage of it is thin -- but
+         relaxing three more steps down to 'Engineering Conference' pulled
+         in a materials-science journal, a petroleum-engineering conference,
+         and half a dozen other venues that just happen to also be
+         "engineering conferences"). So relaxation stops one step after the
+         first hit, regardless of how small that hit's works_count is --
+         a low works_count is not evidence that a match is wrong, and isn't
+         worth risking a wide-open generic query to try to pad out.
       2) OpenAlex splits the same conference across several source records by
          year or by naming variant.
       3) A huge, only loosely related source (see `_drop_irrelevant`) can
@@ -254,6 +263,7 @@ async def resolve_sources(
     tokens = name.split()
     found: list[dict] = []
     total = 0
+    hit_at: int | None = None
 
     for cut in range(0, max(len(tokens) - 1, 1)):
         candidate = " ".join(tokens[cut:])
@@ -261,7 +271,11 @@ async def resolve_sources(
         seen = {r.get("id") for r in found}
         found += [r for r in batch if r.get("id") not in seen]
         total = sum(r.get("works_count") or 0 for r in found)
+        if found and hit_at is None:
+            hit_at = cut
         if total >= _WEAK_SOURCE_WORKS:
+            break
+        if hit_at is not None and cut >= hit_at + 1:
             break
 
     found.sort(key=lambda r: -(r.get("relevance_score") or 0))
@@ -328,10 +342,21 @@ async def _resolve_unlinked_editions(
     return found
 
 
-async def _fetch_by_doi_prefix(session: AsyncSession, prefix: str, cap: int) -> list[dict]:
-    """Fetch one unlinked edition's papers directly by its shared DOI prefix."""
+async def _fetch_by_doi_prefix(
+    session: AsyncSession, prefix: str, cap: int, cursor: str | None = None
+) -> tuple[list[dict], str | None]:
+    """Fetch one unlinked edition's papers directly by its shared DOI prefix.
+
+    Resumes from `cursor` (OpenAlex's own native works cursor for this one
+    prefix) and returns the next one, or None once this edition is
+    exhausted. Without this, every call restarted from "*" and re-fetched
+    the exact same first `cap` works every time -- confirmed live: a round
+    capped at 8 works per edition (of 63 actually available for just one
+    edition) reported no cursor at all, so "load more" could never reach
+    anything past that first batch, the same gap DBLP's own cursor had.
+    """
     collected: list[dict] = []
-    cur = "*"
+    cur = cursor or "*"
     while len(collected) < cap:
         params = {
             "filter": f"doi_starts_with:{prefix}.,type:!paratext",
@@ -345,12 +370,31 @@ async def _fetch_by_doi_prefix(session: AsyncSession, prefix: str, cap: int) -> 
         payload = resp.json()
         results = payload.get("results") or []
         if not results:
+            cur = None
             break
         collected.extend(results)
         cur = (payload.get("meta") or {}).get("next_cursor")
         if not cur:
             break
-    return collected[:cap]
+    return collected[:cap], cur
+
+
+def _decode_oa_cursor(cursor: str | None) -> tuple[str | None, dict[str, str]]:
+    """Combined cursor -> (general works-search cursor, {doi prefix: its own cursor})."""
+    if not cursor:
+        return None, {}
+    try:
+        data = json.loads(cursor)
+    except ValueError:
+        return None, {}
+    return data.get("general"), data.get("editions") or {}
+
+
+def _encode_oa_cursor(general: str | None, editions: dict[str, str | None]) -> str | None:
+    live_editions = {prefix: cur for prefix, cur in editions.items() if cur}
+    if not general and not live_editions:
+        return None
+    return json.dumps({"general": general, "editions": live_editions})
 
 
 # --------------------------------------------------------------------------- #
@@ -377,7 +421,9 @@ async def search(
     residual = translated.residual
     note = ""
     total = 0
-    cur = cursor or "*"
+    general_cursor_in, edition_cursors_in = _decode_oa_cursor(cursor)
+    edition_cursors_out: dict[str, str | None] = {}
+    cur = general_cursor_in or "*"
     source_ids: set[str] = set()
     # Once a venue name resolves to several source IDs, cap how many results
     # any single one of them can contribute. Without this, a name like 'IEEE
@@ -428,11 +474,13 @@ async def search(
             # concurrently instead keeps this close to the slowest single one.
             cap_each = per_source_cap if per_source_cap is not None else max_results
             edition_batches = await asyncio.gather(
-                *(_fetch_by_doi_prefix(session, prefix, cap_each) for prefix, _ in unlinked)
+                *(_fetch_by_doi_prefix(session, prefix, cap_each, edition_cursors_in.get(prefix))
+                  for prefix, _ in unlinked)
             )
 
             unlinked_described: list[str] = []
-            for (prefix, title), works in zip(unlinked, edition_batches):
+            for (prefix, title), (works, next_edition_cursor) in zip(unlinked, edition_batches):
+                edition_cursors_out[prefix] = next_edition_cursor
                 added = 0
                 for w in works:
                     paper = to_paper(w, None)
@@ -574,4 +622,5 @@ async def search(
             f"Google Scholar too."
         ).strip()
 
-    return collected[:max_results], note, cur, total
+    next_cursor = _encode_oa_cursor(cur, edition_cursors_out)
+    return collected[:max_results], note, next_cursor, total
