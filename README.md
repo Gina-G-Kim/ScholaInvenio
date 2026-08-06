@@ -144,6 +144,11 @@ Paginated requests are spaced out to stay a reasonable citizen of a free,
 volunteer-run service, so a search spanning several unresolved venues or
 several years is slower than OpenAlex.
 
+Each matched venue (and year, if a bounded range applies) tracks its own
+resume point in DBLP's own paginated index, so scrolling for more can page
+arbitrarily deep into a large venue instead of being capped at whatever fit
+in the request that first found it.
+
 </details>
 
 <details>
@@ -217,6 +222,9 @@ typed directly.
   convention. `PJ Hayes` becomes `author:PJ author:Hayes`. Group with quotes
   instead: `"PJ Hayes"` becomes `author:"PJ Hayes"`.
 - **Whitespace means AND.**
+- **A field term can be negated on either side of the colon**:
+  `-source:IEEE` and `source:-IEEE` both exclude that venue (same for
+  `author:` and `intitle:`).
 - Search targets the whole record, not just the title.
 - Wildcards work inside a word (`reason*` matches *reasoning*) and inside a
   phrase (`"deep * network"`).
@@ -344,19 +352,23 @@ network.
 
 Round 1 only fetches a small first batch (`initial_batch` in `/api/config`,
 50 by default) — fast, since it no longer waits on paging deep into any one
-provider before showing anything. Scrolling a round's list within about
-300px of its bottom fetches the next batch (`page_batch`, also 50 by
-default) in the background and appends it in place; a quiet "Scroll for
-more…" line marks a round that has more, "Loading more…" while a fetch is
-in flight. There's no click, no prompt, and no upper limit on how many
-batches accumulate this way, up to 1000 results per provider for a single
-round.
+provider before showing anything. Scrolling a round's list starts fetching
+the next batch (`page_batch`, 50 by default) in the background about one
+screen's height before its actual bottom, so at an ordinary scroll speed the
+batch has already landed by the time you get there; a loading gauge only
+appears if you outscroll it and reach the true bottom before it's done.
+There's no click, no prompt, and no upper limit on how many batches
+accumulate this way, up to 1000 results per provider for a single round.
 
 - Fetched results are appended to that round's existing XML, not written to
   a new file.
 - Providers resume from a cursor, so nothing already seen is fetched again
   (any overlap is still deduplicated by ID). Google Scholar has no cursor to
   resume from (see Providers), so it only ever contributes to round 1.
+- If batches end up getting requested faster than they're served, each next
+  one asks for more up front instead of firing right behind the last —
+  scrolling fast settles into fewer, larger requests rather than a rapid
+  chain of small ones.
 - Any round derived from this one is now based on stale data, so it's
   deleted, with a note explaining why.
 
